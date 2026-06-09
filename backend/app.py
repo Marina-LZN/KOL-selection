@@ -6,7 +6,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -135,8 +135,43 @@ CREATORS = [
 ]
 
 
+DEMO_TASK = {
+    "task_type": "新达人筛选",
+    "brand_name": "清衡实验室",
+    "category": "护肤",
+    "product": "屏障修护精华",
+    "campaign": "618 修护专场",
+    "budget": "20 万",
+    "target_audience": "25-35 岁敏感肌女性，偏理性成分党",
+    "tone_keywords": ["温和修护", "成分党", "专业可信", "克制表达", "真实体验"],
+    "top_n": 3,
+}
+
+
 def clamp(value: float, low: int = 0, high: int = 100) -> int:
     return int(max(low, min(high, round(value))))
+
+
+def has_llm_key() -> bool:
+    return bool(os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY"))
+
+
+def llm_mode() -> str:
+    mode = os.environ.get("LLM_MODE", "auto").strip().lower()
+    return mode if mode in {"auto", "real", "mock"} else "auto"
+
+
+def should_use_real_llm() -> bool:
+    mode = llm_mode()
+    if mode == "mock":
+        return False
+    if mode == "real":
+        return True
+    return has_llm_key()
+
+
+def creator_to_dict(creator: Creator) -> dict[str, Any]:
+    return asdict(creator)
 
 
 def calculate_rule_scores(creator: Creator) -> dict[str, Any]:
@@ -146,16 +181,8 @@ def calculate_rule_scores(creator: Creator) -> dict[str, Any]:
         + min(creator.conversion_rate * 420, 18)
         - max((creator.quote_fee - 25000) / 5000, 0)
     )
-
-    if creator.roi is None:
-        cost = None
-    else:
-        cost = clamp(35 + creator.roi * 14 - creator.quote_fee / 3000 - creator.commission_rate * 25)
-
-    if creator.fulfillment_rate is None:
-        fulfillment = None
-    else:
-        fulfillment = clamp(creator.fulfillment_rate * 100)
+    cost = None if creator.roi is None else clamp(35 + creator.roi * 14 - creator.quote_fee / 3000 - creator.commission_rate * 25)
+    fulfillment = None if creator.fulfillment_rate is None else clamp(creator.fulfillment_rate * 100)
 
     missing = []
     if cost is None:
@@ -175,9 +202,18 @@ def calculate_rule_scores(creator: Creator) -> dict[str, Any]:
     }
 
 
+def risk_text_has_redline(text: str) -> bool:
+    safe_text = (
+        text.replace("未发现明显违规宣传", "")
+        .replace("未发现明显违规", "")
+        .replace("未触发红线", "")
+    )
+    return any(word in safe_text for word in ["夸大", "违规", "立刻见效", "处罚"])
+
+
 def risk_penalty(creator: Creator) -> int:
     joined = " ".join(creator.risk_notes + creator.content_samples)
-    if any(word in joined for word in ["夸大", "违规", "立刻见效", "处罚"]):
+    if risk_text_has_redline(joined):
         return 22
     if any(word in joined for word in ["缺失", "不足"]):
         return 10
@@ -193,7 +229,7 @@ def make_candidate_payload(task: dict[str, Any]) -> list[dict[str, Any]]:
         score = clamp(base_score + category_bonus - risk_penalty(creator))
         candidates.append(
             {
-                **creator.__dict__,
+                **creator_to_dict(creator),
                 "rule_scores": rule_scores,
                 "preliminary_score": score,
                 "recommendation": "推荐" if score >= 78 else "观察" if score >= 60 else "不推荐",
@@ -212,7 +248,7 @@ def extract_json(text: str) -> dict[str, Any]:
         return json.loads(match.group(0))
 
 
-def call_llm(messages: list[dict[str, str]], response_format: str = "json_object") -> dict[str, Any] | str:
+def call_real_llm(messages: list[dict[str, str]], response_format: str = "json_object") -> dict[str, Any] | str:
     api_key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("缺少 LLM_API_KEY 或 OPENAI_API_KEY 环境变量")
@@ -288,8 +324,174 @@ def plan_prompt(task: dict[str, Any], creator: dict[str, Any], tone: dict[str, A
     return [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
 
 
-def build_eval_metrics(tone: dict[str, Any], creator: dict[str, Any], elapsed_ms: int) -> dict[str, Any]:
-    redline_triggered = bool(tone.get("redline_check", {}).get("is_triggered"))
+def mock_tone(task: dict[str, Any], creator: dict[str, Any]) -> dict[str, Any]:
+    sample_text = " ".join(creator["content_samples"] + creator["risk_notes"])
+    is_redline = risk_text_has_redline(sample_text)
+    is_missing = bool(creator["rule_scores"]["missing_fields"]) or "不足" in sample_text
+    keyword_hits = sum(1 for word in task.get("tone_keywords", []) if word[:2] in sample_text or word in creator["audience"])
+    category_match = task.get("category", "") in creator["category"]
+
+    visual = 86 if "画面干净" in sample_text or "镜头稳定" in sample_text else 62 if category_match else 48
+    tone = 88 if "克制" in sample_text or "温和" in sample_text else 42 if is_redline else 65
+    value = 86 if "真实" in sample_text or "少而精" in sample_text else 45 if is_redline else 62
+    audience = 88 if "敏感肌" in creator["audience"] or "轻熟" in creator["audience"] else 58
+    overlap = clamp(58 + keyword_hits * 8 + (10 if category_match else 0))
+    if is_missing:
+        audience = min(audience, 64)
+        overlap = min(overlap, 66)
+
+    scores = {
+        "visual_style_match": {
+            "score": visual,
+            "evidence": creator["content_samples"][:1],
+            "reason": "依据输入中的画面、场景和内容样本判断视觉风格贴合程度。",
+        },
+        "content_tone_match": {
+            "score": tone,
+            "evidence": creator["content_samples"][1:2] or creator["content_samples"][:1],
+            "reason": "依据口播方式、促销强度和表达克制程度判断内容语气。",
+        },
+        "value_match": {
+            "score": value,
+            "evidence": creator["content_samples"][:2],
+            "reason": "依据内容长期传递的消费观和产品表达方式判断价值观一致性。",
+        },
+        "audience_match": {
+            "score": audience,
+            "evidence": [creator["audience"]],
+            "reason": "依据达人受众画像和品牌目标人群判断匹配度。",
+        },
+        "keyword_overlap": {
+            "score": overlap,
+            "evidence": task.get("tone_keywords", [])[:4],
+            "reason": "依据品牌调性关键词、品类词和达人内容主题的重合情况判断。",
+        },
+    }
+    overall = clamp(sum(item["score"] for item in scores.values()) / len(scores))
+    judgement = "不推荐" if is_redline else "推荐" if overall >= 78 else "观察" if overall >= 62 else "不推荐"
+
+    return {
+        "overall_score": overall,
+        "overall_judgement": judgement,
+        "confidence": "低" if is_missing else "中" if is_redline else "高",
+        "dimension_scores": scores,
+        "risk_flags": [
+            {
+                "risk_type": "合规表达风险",
+                "risk_level": "红线" if is_redline else "中",
+                "evidence": "；".join(creator["risk_notes"]),
+                "impact": "可能影响品牌安全和活动投放稳定性。",
+            }
+        ]
+        if (is_redline or creator["risk_notes"])
+        else [],
+        "redline_check": {
+            "is_triggered": is_redline,
+            "redline_type": "法律合规红线" if is_redline else "",
+            "reason": "命中夸大功效或违规表达风险。" if is_redline else "未触发红线。",
+        },
+        "final_short_reason": "模拟输出：用于无 API Key 演示。真实环境会调用配置的大模型 API。",
+    }
+
+
+def mock_report(task: dict[str, Any], creator: dict[str, Any], tone: dict[str, Any]) -> str:
+    scores = creator["rule_scores"]
+    missing = scores["missing_fields"] or ["无"]
+    return f"""# {creator['name']}｜{tone['overall_judgement']}
+
+## 基础画像
+- 平台：{creator['platform']}
+- 类目：{creator['category']}
+- 粉丝规模：{creator['followers']:,}
+- 受众画像：{creator['audience']}
+
+## 内容与调性表现
+- 调性总分：{tone['overall_score']}
+- 结论：{tone['final_short_reason']}
+- 关键证据：{creator['content_samples'][0]}
+
+## 数据与商业能力表现
+- 带货能力分：{scores['selling_power_score']}
+- 成本效率分：{scores['cost_efficiency_score'] if scores['cost_efficiency_score'] is not None else '信息不足'}
+- 履约稳定性分：{scores['fulfillment_stability_score'] if scores['fulfillment_stability_score'] is not None else '信息不足'}
+- 规则侧分数不由 LLM 改写，只用于解释和排序。
+
+## 风险提示
+- {'；'.join(creator['risk_notes'])}
+
+## 合规性判断
+- 是否触发红线：{'是' if tone['redline_check']['is_triggered'] else '否'}
+- 说明：{tone['redline_check']['reason']}
+
+## 推荐理由
+- 如果用于 {task.get('campaign', '活动')}，建议优先看调性匹配、成本效率和履约稳定性的组合表现。
+
+## 合作建议
+- 推荐：小预算试水，先验证内容点击、加购和转化，再决定是否扩大投放。
+- 观察：若信息不足，先补齐 ROI、履约记录和直播承接数据。
+- 不推荐：若命中红线，不进入常规合作方案。
+
+## 信息不足项
+- {', '.join(missing)}
+"""
+
+
+def mock_plan(task: dict[str, Any], creator: dict[str, Any], tone: dict[str, Any]) -> str:
+    if tone["redline_check"]["is_triggered"]:
+        return f"""# 不建议合作
+
+## 红线原因
+- {tone['redline_check']['reason']}
+
+## 业务影响
+- 不继续生成正向合作方案，避免品牌安全和合规风险。
+
+## 后续动作
+- 更换候选达人，或要求达人提供合规表达承诺和历史处罚证明后再人工复核。
+"""
+
+    return f"""# 方案概述
+- 合作目标：为 {task.get('product')} 做 {task.get('campaign')} 种草与转化承接。
+- 推荐合作等级：{tone['overall_judgement']}
+- 方案一句话总结：用达人内容风格承接品牌“{', '.join(task.get('tone_keywords', [])[:3])}”调性。
+- 关键限制：预算 {task.get('budget')}，需控制投放节奏和合规表达。
+
+## 合作定位
+- 达人角色：专业种草 / 场景体验型达人。
+- 适合承接的任务：短视频种草、评论区答疑、小预算直播承接。
+- 不适合承接的任务：直接大预算强转化，需先验证 ROI。
+
+## 内容方向设计
+- 短视频方向：成分拆解、使用场景、换季修护。
+- 直播方向：福利机制轻承接，不做夸大功效承诺。
+- 核心卖点表达：温和修护、真实体验、成分可信。
+
+## 执行节奏建议
+- 预热期：发布 1 条内容种草，观察点击和收藏。
+- 爆发期：活动期挂车或直播承接。
+- 复盘期：回收 CTR、CVR、ROI、评论痛点和售后反馈。
+
+## 预算与资源建议
+- 建议先投 20%-30% 预算做试水。
+- 达标后再追加预算，避免一次性重投。
+
+## KPI 建议
+- 曝光指标：播放量、点击率。
+- 互动指标：评论问题数、收藏率。
+- 转化指标：加购率、CVR、GMV。
+- 成本指标：ROI、单次转化成本。
+
+## 合规性与红线判断
+- 是否触发红线：否。
+- 需要人工确认项：投放前复核脚本功效表达。
+
+## 风险与备选方案
+- 主要风险：转化承接能力需验证。
+- 降风险动作：小预算 A/B 测试，按结果决定加投。
+"""
+
+
+def build_eval_metrics(tone: dict[str, Any], creator: dict[str, Any], elapsed_ms: int, source: str) -> dict[str, Any]:
     evidence_items = []
     for value in tone.get("dimension_scores", {}).values():
         evidence_items.extend(value.get("evidence", []) or [])
@@ -298,17 +500,24 @@ def build_eval_metrics(tone: dict[str, Any], creator: dict[str, Any], elapsed_ms
         hallucination_risk = "高"
 
     return {
+        "format_pass": True,
         "tone_score_available": isinstance(tone.get("overall_score"), (int, float)),
         "evidence_count": len(evidence_items),
         "hallucination_risk": hallucination_risk,
-        "redline_triggered": redline_triggered,
-        "format_pass": True,
+        "redline_triggered": bool(tone.get("redline_check", {}).get("is_triggered")),
         "latency_ms": elapsed_ms,
-        "estimated_cost_note": "真实成本取决于 LLM_MODEL 与输入输出 token，本 demo 在后端记录模型和耗时。",
+        "llm_source": source,
+        "quality_gates": [
+            {"name": "红线漏判率", "target": "0", "current": "0 / demo"},
+            {"name": "格式通过率", "target": ">=95%", "current": "通过"},
+            {"name": "幻觉率", "target": "<=3%", "current": hallucination_risk},
+            {"name": "证据引用", "target": "每维至少 1 条", "current": f"{len(evidence_items)} 条"},
+        ],
         "platform_metrics": {
             "nps": 42,
-            "avg_manual_time_saved_hours": 3.5,
-            "expected_conversion_lift": "以灰度实验对比人工筛选结果衡量",
+            "manual_time_saved": "从数小时压缩到分钟级",
+            "adoption_rate": "灰度后看推荐采纳率",
+            "expected_conversion_lift": "以合作 ROI / CVR 对比人工筛选结果衡量",
         },
     }
 
@@ -317,17 +526,31 @@ def analyze(task: dict[str, Any], creator_id: str | None) -> dict[str, Any]:
     started = time.time()
     candidates = make_candidate_payload(task)
     selected = next((item for item in candidates if item["id"] == creator_id), candidates[0])
+    source = "mock"
+    warning = ""
 
-    tone = call_llm(tone_prompt(task, selected), response_format="json_object")
-    report = call_llm(report_prompt(task, selected, tone), response_format="text")
-    plan = call_llm(plan_prompt(task, selected, tone, report), response_format="text")
+    if should_use_real_llm():
+        try:
+            tone = call_real_llm(tone_prompt(task, selected), response_format="json_object")
+            report = call_real_llm(report_prompt(task, selected, tone), response_format="text")
+            plan = call_real_llm(plan_prompt(task, selected, tone, report), response_format="text")
+            source = "real"
+        except Exception as exc:
+            if llm_mode() == "real":
+                raise
+            warning = f"真实模型调用失败，已回退到模拟输出：{exc}"
+            tone = mock_tone(task, selected)
+            report = mock_report(task, selected, tone)
+            plan = mock_plan(task, selected, tone)
+            source = "mock_fallback"
+    else:
+        tone = mock_tone(task, selected)
+        report = mock_report(task, selected, tone)
+        plan = mock_plan(task, selected, tone)
 
     elapsed_ms = int((time.time() - started) * 1000)
     tone_score = tone.get("overall_score")
-    if isinstance(tone_score, (int, float)):
-        selected["final_score"] = clamp(selected["preliminary_score"] * 0.65 + tone_score * 0.35)
-    else:
-        selected["final_score"] = selected["preliminary_score"]
+    selected["final_score"] = clamp(selected["preliminary_score"] * 0.65 + tone_score * 0.35) if isinstance(tone_score, (int, float)) else selected["preliminary_score"]
 
     return {
         "task": task,
@@ -336,25 +559,27 @@ def analyze(task: dict[str, Any], creator_id: str | None) -> dict[str, Any]:
         "tone_match": tone,
         "profile_report": report,
         "marketing_plan": plan,
-        "eval_metrics": build_eval_metrics(tone, selected, elapsed_ms),
+        "eval_metrics": build_eval_metrics(tone, selected, elapsed_ms, source),
         "llm": {
             "base": os.environ.get("LLM_API_BASE", "https://api.openai.com/v1"),
             "model": os.environ.get("LLM_MODEL", "gpt-4.1-mini"),
+            "mode": llm_mode(),
+            "source": source,
+            "key_present": has_llm_key(),
+            "warning": warning,
         },
     }
 
 
-DEMO_TASK = {
-    "task_type": "新达人筛选",
-    "brand_name": "清衡实验室",
-    "category": "护肤",
-    "product": "屏障修护精华",
-    "campaign": "618 修护专场",
-    "budget": "20 万",
-    "target_audience": "25-35 岁敏感肌女性，偏理性成分党",
-    "tone_keywords": ["温和修护", "成分党", "专业可信", "克制表达", "真实体验"],
-    "top_n": 3,
-}
+def config_payload() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "model": os.environ.get("LLM_MODEL", "gpt-4.1-mini"),
+        "base": os.environ.get("LLM_API_BASE", "https://api.openai.com/v1"),
+        "mode": llm_mode(),
+        "key_present": has_llm_key(),
+        "real_call_enabled": should_use_real_llm(),
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -363,10 +588,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/api/health":
-            self._send({"ok": True, "model": os.environ.get("LLM_MODEL", "gpt-4.1-mini")})
+            self._send(config_payload())
             return
         if self.path == "/api/demo-data":
-            self._send({"task": DEMO_TASK, "candidates": make_candidate_payload(DEMO_TASK)})
+            self._send({"task": DEMO_TASK, "candidates": make_candidate_payload(DEMO_TASK), "config": config_payload()})
             return
         self._send({"error": "not found"}, 404)
 
@@ -405,4 +630,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"Daren Screening Agent backend: http://{HOST}:{PORT}")
+    print(f"LLM config: {json.dumps(config_payload(), ensure_ascii=False)}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
